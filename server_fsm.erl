@@ -31,6 +31,7 @@
 
 -export([start_link/1, info/1, init/1, handle_info/3, terminate/3]).
 -export([connect/2, wait_banner/2, send_playergame/2, wait_extra/2, deal_test/2, play_test/2]).
+-export([pregame_disconnect_test/2, disconnect_test/2]).
 
 start_link(Port) ->
 	gen_fsm:start_link(?MODULE, [Port], []).
@@ -119,10 +120,10 @@ drain_player_msg() ->
 
 kill_players(S) ->
 	[P1, P2, P3, P4] = S#state.players,
-	P1 ! timeout, receive {p1, timeout} -> ok after 5000 -> ok end,
-	P2 ! timeout, receive {p2, timeout} -> ok after 5000 -> ok end,
-	P3 ! timeout, receive {p3, timeout} -> ok after 5000 -> ok end,
-	P4 ! timeout, receive {p4, timeout} -> ok after 5000 -> ok end,
+	P1 ! timeout, receive {p1, timeout} -> ok after 1000 -> ok end,
+	P2 ! timeout, receive {p2, timeout} -> ok after 1000 -> ok end,
+	P3 ! timeout, receive {p3, timeout} -> ok after 1000 -> ok end,
+	P4 ! timeout, receive {p4, timeout} -> ok after 1000 -> ok end,
 	drain_player_msg().
 
 deal_test(timeout, S = #state{port = Port}) ->
@@ -155,8 +156,9 @@ deal_test({p1, first_bid}, S = #state{flags = Fl, players = [P1 | _]}) ->
 	{next_state, deal_test, update_ets(S#state{flags = Fl2})};
 deal_test({p2, {bid, <<"4C">>}}, S = #state{flags = Fl}) ->
 	Fl2 = gb_sets:add_element(second_bid_ok, Fl),
+	Fl3 = gb_sets:del_element(deal_timeout, Fl2),
 	kill_players(S),
-	{next_state, play_test, update_ets(S#state{flags = Fl2}), 5000};
+	{next_state, play_test, update_ets(S#state{flags = Fl3}), 5000};
 deal_test({p1, _}, S) -> {next_state, deal_test, S};
 deal_test({p2, _}, S) -> {next_state, deal_test, S};
 deal_test({p3, _}, S) -> {next_state, deal_test, S};
@@ -165,6 +167,14 @@ deal_test({p4, _}, S) -> {next_state, deal_test, S}.
 hand_split(<<>>) -> [];
 hand_split(<<Rank, Suit, Rest/binary>>) ->
 	[[Rank, Suit] | hand_split(Rest)].
+
+select_next_card(Suit, Hand) ->
+	case [[Rank,Suit2] || [Rank,Suit2] <- Hand, Suit2 =:= Suit] of
+		[NextCard | Rest] -> {NextCard, Rest};
+		[] ->
+			[NextCard | Rest] = Hand,
+			{NextCard, Rest}
+	end.
 
 play_test(timeout, S = #state{port = Port}) ->
 	Me = self(),
@@ -203,6 +213,38 @@ play_test(timeout, S = #state{port = Port}) ->
 		receive {p3, {follow, SuitBin}} -> ok after 5000 -> error(no_follow) end,
 		Me ! {set_flag, play_cards},
 
+		P3 ! {send, [P2Play1,<<"\n">>]},
+		receive {p3, {follow, SuitBin}} -> ok after 5000 ->
+			Me ! {set_flag, accepts_bad_play}, error(bad_play) end,
+
+		case [[Rank,Suit2] || [Rank,Suit2] <- P3H, Suit2 =:= Suit] of
+			[] -> ok;
+			_ ->
+				[P3PlayBad1 | _] = [[Rank,Suit2] || [Rank,Suit2] <- P3H, Suit2 =/= Suit],
+				P3 ! {send, [P3PlayBad1, <<"\n">>]},
+				receive {p3, {follow, SuitBin}} -> ok after 5000 ->
+					Me ! {set_flag, accepts_bad_play}, error(bad_play) end
+		end,
+
+		{P3Play1, P3H2} = select_next_card(Suit, P3H),
+		P3 ! {send, [P3Play1, <<"\n">>]},
+		receive {p3, accept} -> ok after 5000 -> error(no_accept) end,
+
+		receive {p4, {follow, SuitBin}} -> ok after 5000 -> error(no_follow) end,
+		drain_player_msg(),
+		{P4Play1, P4H2} = select_next_card(Suit, P4H),
+		P4 ! {send, [P4Play1, <<"\n">>]},
+		receive {p4, accept} -> ok after 5000 -> error(no_accept) end,
+
+		receive {p1, {follow, SuitBin}} -> ok after 5000 -> error(no_follow) end,
+		drain_player_msg(),
+		{P1Play1, P1H2} = select_next_card(Suit, P1H),
+		P1 ! {send, [P1Play1, <<"\n">>]},
+		receive {p1, accept} -> ok after 5000 -> error(no_accept) end,
+
+		receive {_, lead} -> ok after 5000 -> error(no_lead) end,
+		Me ! {set_flag, can_finish_hand},
+
 		Me ! play_test_done
 	end),
 	Bytes = base64:encode(crypto:rand_bytes(9)),
@@ -216,10 +258,110 @@ play_test({'EXIT', Pid, Reason}, S = #state{flags = Fl, runner = Pid}) ->
 play_test({set_flag, F}, S = #state{flags = Fl}) ->
 	Fl2 = gb_sets:add_element(F, Fl),
 	{next_state, play_test, update_ets(S#state{flags = Fl2}), 30000};
-play_test(play_test_done, S = #state{runner = Pid}) ->
+play_test(play_test_done, S = #state{runner = Pid, flags = Fl}) ->
 	kill_players(S),
 	receive {'EXIT', Pid, normal} -> ok end,
-	{next_state, connect, update_ets(S), 30000}.
+	Fl2 = gb_sets:del_element(play_test_timeout, Fl),
+	{next_state, pregame_disconnect_test, update_ets(S#state{flags = Fl2}), 5000}.
+	%{next_state, connect, update_ets(S#state{flags = Fl2}), 30000}.
+
+pregame_disconnect_test(timeout, S = #state{port = Port}) ->
+	Me = self(),
+	Runner = spawn_link(fun() ->
+		timer:kill_after(30000),
+
+		Players = receive {players, PP} -> PP after 5000 -> error(no_players) end,
+		[P1,P2,P3] = Players,
+		receive {p3, sent_playergame} -> ok after 5000 -> error(p3_no_playergame) end,
+		P3 ! timeout,
+		receive {p3, timeout} -> ok after 5000 -> error(p3_no_timeout) end,
+		Me ! p4plz,
+		receive {players, [P4]} -> ok end,
+
+		[P1H,P2H,P4H] = [receive {P, {hand, H}} -> hand_split(H) after 5000 ->
+			Me ! {set_flag, bad_pregame_disconnect},
+			error(no_hand) end || P <- [p1,p2,p4]],
+
+		receive {p1, first_bid} -> ok after 5000 ->
+			Me ! {set_flag, bad_pregame_disconnect},
+			error(no_first_bid) end,
+
+		Me ! pregame_disconnect_test_done
+	end),
+	Bytes = base64:encode(crypto:rand_bytes(9)),
+	Players = [P || {ok, P} <- [player_fsm:start(Runner, A, Bytes, Port) || A <- [p1,p2,p3]]],
+	Runner ! {players, Players},
+	receive p4plz ->
+		Players2 = [P || {ok, P} <- [player_fsm:start(Runner, p4, Bytes, Port)]],
+		Runner ! {players, Players2},
+		{next_state, pregame_disconnect_test, S#state{players = Players ++ Players2, runner = Runner}}
+	after 5000 ->
+		self() ! {set_flag, bad_pregame_disconnect},
+		{next_state, pregame_disconnect_test, S#state{players = Players, runner = Runner}}
+	end;
+pregame_disconnect_test({'EXIT', Pid, Reason}, S = #state{flags = Fl, runner = Pid}) ->
+	Fl2 = gb_sets:add_element(bad_pregame_disconnect, Fl),
+	kill_players(S),
+	{next_state, connect, update_ets(S#state{flags = Fl2}), 30000};
+pregame_disconnect_test({set_flag, F}, S = #state{flags = Fl}) ->
+	Fl2 = gb_sets:add_element(F, Fl),
+	{next_state, pregame_disconnect_test, update_ets(S#state{flags = Fl2}), 30000};
+pregame_disconnect_test(pregame_disconnect_test_done, S = #state{runner = Pid, flags = Fl}) ->
+	kill_players(S),
+	receive {'EXIT', Pid, normal} -> ok end,
+	Fl2 = gb_sets:del_element(bad_pregame_disconnect, Fl),
+	{next_state, disconnect_test, update_ets(S#state{flags = Fl2}), 5000}.
+	%{next_state, connect, update_ets(S#state{flags = Fl2}), 30000}.
+
+disconnect_test(timeout, S = #state{port = Port}) ->
+	Me = self(),
+	Runner = spawn_link(fun() ->
+		timer:kill_after(30000),
+
+		Players = receive {players, PP} -> PP after 5000 -> error(no_players) end,
+		[P1,P2,P3,P4] = Players,
+		[P1H,P2H,P3H,P4H] = [receive {P, {hand, H}} -> hand_split(H) after 5000 -> error(no_hand) end || P <- [p1,p2,p3,p4]],
+
+		receive {p1, first_bid} -> ok after 5000 -> error(no_first_bid) end,
+		drain_player_msg(),
+
+		P1 ! {send, <<"5C\n">>},
+		receive {p2, {bid, <<"5C">>}} -> ok end,
+		P2 ! {send, <<"6C\n">>},
+		receive {p3, {bid, <<"6C">>}} -> ok end,
+		P2 ! timeout,
+		receive {p2, timeout} -> ok end,
+		P3 ! {send, <<"PP\n">>},
+		receive {p4, {bid, <<"6C">>}} -> ok after 5000 ->
+			Me ! {set_flag, bad_disconnect}, error(nobid) end,
+		P4 ! {send, <<"7C\n">>},
+		receive {p1, {bid, <<"7C">>}} -> ok after 5000 ->
+			Me ! {set_flag, bad_disconnect}, error(nobid) end,
+		drain_player_msg(),
+
+		P1 ! {send, <<"PP\n">>},
+		[receive {P, protocol_err} -> ok after 5000 ->
+			Me ! {set_flag, bad_disconnect}, error(nodiscon) end || P <- [p1,p3,p4]],
+
+		Me ! disconnect_test_done
+	end),
+	Bytes = base64:encode(crypto:rand_bytes(9)),
+	Players = [P || {ok, P} <- [player_fsm:start(Runner, A, Bytes, Port) || A <- [p1,p2,p3,p4]]],
+	Runner ! {players, Players},
+	{next_state, disconnect_test, S#state{players = Players, runner = Runner}};
+disconnect_test({'EXIT', Pid, Reason}, S = #state{flags = Fl, runner = Pid}) ->
+	Fl2 = gb_sets:add_element(bad_disconnect, Fl),
+	kill_players(S),
+	{next_state, connect, update_ets(S#state{flags = Fl2}), 30000};
+disconnect_test({set_flag, F}, S = #state{flags = Fl}) ->
+	Fl2 = gb_sets:add_element(F, Fl),
+	{next_state, disconnect_test, update_ets(S#state{flags = Fl2}), 30000};
+disconnect_test(disconnect_test_done, S = #state{runner = Pid, flags = Fl}) ->
+	kill_players(S),
+	receive {'EXIT', Pid, normal} -> ok end,
+	Fl2 = gb_sets:del_element(bad_disconnect, Fl),
+	%{next_state, pregame_disconnect_test, update_ets(S#state{flags = Fl2}), 5000}.
+	{next_state, connect, update_ets(S#state{flags = Fl2}), 30000}.
 
 terminate(_Reason, _State, _S = #state{port = _Port}) -> ok.
 

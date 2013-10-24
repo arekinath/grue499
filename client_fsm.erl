@@ -65,6 +65,7 @@ format_flags(Flags) ->
 		{second_bid_ok, <<"2">>},
 		{full_bidding, <<"f">>},
 		{play_cards, <<"P">>},
+		{can_finish_hand, <<"h">>},
 		{extra_msg, <<"x">>}
 		], Flags),
 	Eflgs = format_flags([
@@ -74,7 +75,10 @@ format_flags(Flags) ->
 		{disconnected_before_deal, <<"D">>},
 		{deal_timeout, <<"t">>},
 		{dealt_bad_hand, <<"H">>},
+		{accepts_bad_play, <<"p">>},
 		{play_test_timeout, <<"T">>},
+		{bad_pregame_disconnect, <<"E">>},
+		{bad_disconnect, <<"x">>},
 		{longline, <<"L">>}
 		], Flags),
 	{Iflgs, Eflgs}.
@@ -99,6 +103,7 @@ gather_data(timeout, S = #state{sock = Sock}) ->
 	ok = gen_tcp:send(Sock, <<"            2  --  prompts for second bid\n">>),
 	ok = gen_tcp:send(Sock, <<"            f  --  full bidding round incl. pass\n">>),
 	ok = gen_tcp:send(Sock, <<"            P  --  can play a card from hand\n">>),
+	ok = gen_tcp:send(Sock, <<"            h  --  can finish a hand and lead the next\n">>),
 	ok = gen_tcp:send(Sock, <<"            x  --  sends extra M messages not in spec\n">>),
 	ok = gen_tcp:send(Sock, <<"Err flags:  d  --  down\n">>),
 	ok = gen_tcp:send(Sock, <<"            e  --  protocol errors\n">>),
@@ -106,10 +111,13 @@ gather_data(timeout, S = #state{sock = Sock}) ->
 	ok = gen_tcp:send(Sock, <<"            D  --  disconnected before deal\n">>),
 	ok = gen_tcp:send(Sock, <<"            t  --  timeout waiting for hands to be dealt\n">>),
 	ok = gen_tcp:send(Sock, <<"            H  --  invalid hand dealt\n">>),
+	ok = gen_tcp:send(Sock, <<"            p  --  accepted an invalid play\n">>),
 	ok = gen_tcp:send(Sock, <<"            T  --  timed out during play test\n">>),
+	ok = gen_tcp:send(Sock, <<"            E  --  does not handle pregame disconnects correctly\n">>),
+	ok = gen_tcp:send(Sock, <<"            x  --  does not in-game disconnects correctly\n">>),
 	ok = gen_tcp:send(Sock, <<"            L  --  sent a >64kb line\n\n">>),
-	ok = gen_tcp:send(Sock, io_lib:format("~8s ~8s ~-10s  ~-10s ~-10s  ~-70s\n", ["port", "pid", "owner", "impl", "err", "banner"])),
-	ok = gen_tcp:send(Sock, io_lib:format("~8s ~8s ~-10s  ~-10s ~-10s  ~-70s\n", ["===", "===", "===", "===", "===", "==="])),
+	ok = gen_tcp:send(Sock, io_lib:format("~8s ~8s ~-10s  ~-10s ~-12s  ~-70s\n", ["port", "pid", "owner", "impl", "err", "banner"])),
+	ok = gen_tcp:send(Sock, io_lib:format("~8s ~8s ~-10s  ~-10s ~-12s  ~-70s\n", ["===", "===", "===", "===", "===", "==="])),
 	lists:foreach(fun({Port, ServFsm}) ->
 		case (catch server_fsm:info(ServFsm)) of
 			{ok, _, []} -> ok;
@@ -119,7 +127,7 @@ gather_data(timeout, S = #state{sock = Sock}) ->
 				[{Pid, Owner}] = ets:lookup(pid_owner, Pid),
 				{Impl, Err} = format_flags(Flags),
 				ok = gen_tcp:send(Sock, io_lib:format(
-					"~8s ~8s ~-10s  ~-10s ~-10s  ~-70s\n", [
+					"~8s ~8s ~-10s  ~-10s ~-12s  ~-70s\n", [
 						integer_to_list(Port),
 						integer_to_list(Pid),
 						Owner,

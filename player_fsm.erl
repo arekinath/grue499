@@ -78,6 +78,7 @@ send_playergame(timeout, S = #state{sock = Sock, rand = Rand, tag = Tag}) ->
 	TagBin = atom_to_binary(Tag, latin1),
 	ok = gen_tcp:send(Sock, <<TagBin/binary, Rand/binary, "\n">>),
 	ok = gen_tcp:send(Sock, <<"gruegame_", Rand/binary, "\n">>),
+	?send(sent_playergame),
 	{next_state, wait_hand, S, 20000}.
 
 wait_hand({line, <<"M", _Msg/binary>>}, S = #state{}) ->
